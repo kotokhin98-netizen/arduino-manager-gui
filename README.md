@@ -53,3 +53,4 @@ The current build uses a desktop-oriented layout: left navigation, a dedicated s
 While an operation is running, a Cancel button appears in the header. Network requests use the active operation context and git commands are started with `exec.CommandContext`, so cancellation can interrupt them.
 
 Long repository names and descriptions in the results list are truncated with ellipsis so they stay inside the results pane.
+    
