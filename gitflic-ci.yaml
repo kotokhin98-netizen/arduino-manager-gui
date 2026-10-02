@@ -1,0 +1,217 @@
+# ==============================================================================
+# Arduino Manager — CI/CD pipeline for GitFlic
+#
+# Default location: gitflic-ci.yaml in the repository root.
+#   Docs: https://docs.gitflic.ru/cicd/gitflic-ci-yaml
+#
+# This single file serves BOTH product lines that live in this repository:
+#
+#   branch `gui`    -> Go + Fyne desktop app  (go.mod present)
+#   branch `master` -> bash CLI               (arduino-manager.sh present)
+#
+# Jobs are selected with `rules:exists` rather than a branch-name check, so the
+# exact same file works on branches AND on tags without a naming convention:
+# a tag cut from the `gui` branch still triggers the Go jobs, a tag cut from
+# `master` still triggers the CLI jobs.
+#
+# Requires a Docker-type agent (Settings -> CI/CD -> Agents). The `release` job
+# additionally needs the GitFlic CLI image, see the comment on that job.
+# ==============================================================================
+
+stages:
+  - check
+  - build
+  - release
+
+variables:
+  APP_NAME: "arduino-manager-gui"
+
+# -----------------------------------------------------------------------------
+# Reusable fragments
+# -----------------------------------------------------------------------------
+
+# Fyne links against OpenGL/X11/Wayland through cgo, and the official `golang`
+# image ships none of those headers. Without them the build fails inside
+# go-gl/glfw with `fatal error: wayland-client-core.h: No such file`.
+# `entrypoint: [""]` clears the image ENTRYPOINT so the agent can run `script`.
+.go_env: &go_env
+  image:
+    name: "golang:1.26-bookworm"
+    entrypoint: [""]
+  before_script:
+    - apt-get update -qq
+    - >-
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      gcc g++ pkg-config
+      libgl1-mesa-dev xorg-dev
+      libwayland-dev libxkbcommon-dev
+      ca-certificates
+    - go version
+
+# Minimal image for static analysis of the bash CLI.
+# NOTE: not `debian:*-slim` -- those images ship no /bin/bash at all, so the
+# agent cannot execute any script line. A full bookworm base has bash and sh.
+.shell_env: &shell_env
+  image:
+    name: "debian:bookworm"
+    entrypoint: [""]
+  before_script:
+    - apt-get update -qq
+    - >-
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      bash shellcheck
+
+# -----------------------------------------------------------------------------
+# Stage: check
+# -----------------------------------------------------------------------------
+
+go-lint:
+  <<: *go_env
+  stage: check
+  rules:
+    - exists:
+        - go.mod
+  script:
+    # Formatting: hard gate. Keeps diffs free of whitespace noise.
+    - |
+      unformatted="$(gofmt -l .)"
+      if [ -n "$unformatted" ]; then
+        echo ":: These files are not gofmt-clean ::"
+        echo "$unformatted"
+        echo "Fix locally with: gofmt -w ."
+        exit 1
+      fi
+      echo "gofmt: all files formatted"
+    # Static analysis: hard gate.
+    - go vet ./...
+    # Dependency bookkeeping: catches a go.mod/go.sum that drifted from main.go.
+    - go mod tidy
+    - |
+      if ! git diff --exit-code --quiet go.mod go.sum; then
+        echo ":: go.mod / go.sum are not tidy - run 'go mod tidy' and commit ::"
+        git --no-pager diff go.mod go.sum
+        exit 1
+      fi
+      echo "go.mod / go.sum: tidy"
+
+go-test:
+  <<: *go_env
+  stage: check
+  rules:
+    - exists:
+        - go.mod
+  script:
+    - go test -count=1 ./...
+
+shell-lint:
+  <<: *shell_env
+  stage: check
+  rules:
+    - exists:
+        - arduino-manager.sh
+  script:
+    # Syntax: hard gate.
+    - bash -n arduino-manager.sh
+    # Quoted: an unquoted YAML scalar containing ": " would parse as a mapping.
+    - 'echo "bash -n: syntax OK"'
+    # Style/safety: advisory only. The script currently emits SC2034/SC2115/SC2155
+    # warnings, so this reports without blocking the pipeline.
+    - |
+      if shellcheck -S warning arduino-manager.sh; then
+        echo "shellcheck: no findings"
+      else
+        echo "shellcheck: findings reported above (advisory, not blocking)"
+      fi
+
+# -----------------------------------------------------------------------------
+# Stage: build
+# -----------------------------------------------------------------------------
+
+build-gui-linux:
+  <<: *go_env
+  stage: build
+  rules:
+    - exists:
+        - go.mod
+  script:
+    - go build -trimpath -ldflags="-s -w" -o "$APP_NAME" .
+    - mkdir -p dist
+    - mv "$APP_NAME" dist/
+    - tar -czf "dist/${APP_NAME}-${CI_COMMIT_REF_NAME}-linux-amd64.tar.gz" -C dist "$APP_NAME"
+    - (cd dist && sha256sum "${APP_NAME}-${CI_COMMIT_REF_NAME}-linux-amd64.tar.gz" > SHA256SUMS)
+    - ls -la dist/
+  artifacts:
+    name: "gui-linux-$CI_COMMIT_REF_NAME-$CI_PIPELINE_IID"
+    paths:
+      - dist/
+    expire_in: 4 weeks
+
+# -----------------------------------------------------------------------------
+# Stage: release
+# -----------------------------------------------------------------------------
+
+# Creates a GitFlic release for the tag being built.
+#
+# NOTE: the `release` keyword is supported ONLY by Docker-type agents running
+# the GitFlic CLI image, so that image is set explicitly below.
+#
+# This job intentionally has no `needs:`. The build jobs are branch-conditional,
+# so a `needs` on either of them would stall a release cut from the other branch.
+# Build outputs stay available as artifacts from the `build` stage.
+release:
+  stage: release
+  image:
+    name: "registry.gitflic.ru/company/gitflic/gcli:latest"
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release for $CI_COMMIT_TAG"
+  release:
+    # Must be 40 characters or fewer.
+    name: "$CI_COMMIT_TAG"
+    description: "Automated build for $CI_COMMIT_TAG (pipeline $CI_PIPELINE_ID)."
+    tag_name: "$CI_COMMIT_TAG"
+
+# ==============================================================================
+# Optional: cross-platform builds
+#
+# Left commented out on purpose. A job whose `tags` match no registered agent
+# stays pending forever and stalls the whole `build` stage, so enable these only
+# once the matching agent actually exists in the project.
+#
+# Windows (needs a PowerShell-type agent on a Windows host; Fyne uses cgo and
+# does not cross-compile from Linux):
+#
+#   build-gui-windows:
+#     stage: build
+#     tags:
+#       - windows
+#     rules:
+#       - exists:
+#           - go.mod
+#     script:
+#       - go build -trimpath -ldflags="-s -w" -o arduino-manager-gui.exe .
+#     artifacts:
+#       name: "gui-windows-$CI_COMMIT_REF_NAME-$CI_PIPELINE_IID"
+#       paths:
+#         - arduino-manager-gui.exe
+#       expire_in: 4 weeks
+#
+# macOS (needs a Shell-type agent on macOS; same cgo limitation):
+#
+#   build-gui-macos:
+#     stage: build
+#     tags:
+#       - macos
+#     rules:
+#       - exists:
+#           - go.mod
+#     script:
+#       - go build -trimpath -ldflags="-s -w" -o arduino-manager-gui .
+#     artifacts:
+#       name: "gui-macos-$CI_COMMIT_REF_NAME-$CI_PIPELINE_IID"
+#       paths:
+#         - arduino-manager-gui
+#       expire_in: 4 weeks
+# ==============================================================================

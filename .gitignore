@@ -1,0 +1,9 @@
+/arduino-manager
+/arduino-manager-*
+*.exe
+.env
+.idea/
+.vscode/
+*.iml
+dist/
+build/
